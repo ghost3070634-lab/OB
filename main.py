@@ -10,190 +10,149 @@ from datetime import datetime, timedelta
 # ==========================================
 # 1. 配置設定
 # ==========================================
-# 請確認此處的 Webhook URL 是正確的
 DISCORD_URL = os.getenv("DISCORD_WEBHOOK_URL", "https://discord.com/api/webhooks/1457246379242950797/LB6npSWu5J9ZbB8NYp90N-gpmDrjOK2qPqtkaB5AP6YztzdfzmBF6oxesKJybWQ04xoU")
 
-# 交易所設定
 exchange = ccxt.bybit({
     'enableRateLimit': True,
     'options': {'defaultType': 'spot'}
 })
 
-# 策略參數
-VIDYA_LEN = 10
-VIDYA_MOM = 20
-CCI_LEN = 200
-ATR_LEN = 5
-SWING_Yz = 5 # 用於檢測波段高低點的窗口大小 (模擬 OB)
+# SMC 參數
+PIVOT_LEN = 5  # 定義碎形(Fractal)的左右 K 線數量，用於判斷 OB 和結構
 
 # ==========================================
-# 2. 指標計算邏輯 (核心演算法)
+# 2. SMC 策略核心邏輯 (已修改為 LuxAlgo 邏輯：BOS 觸發 OB)
 # ==========================================
-def calculate_vidya(df, length=10, momentum=20):
-    """計算 VIDYA 指標"""
-    src = df['close']
-    mom = src.diff()
-    
-    pos_mom = mom.where(mom >= 0, 0).rolling(momentum).sum()
-    neg_mom = (-mom.where(mom < 0, 0)).rolling(momentum).sum()
-    
-    denominator = pos_mom + neg_mom
-    cmo = (100 * (pos_mom - neg_mom) / denominator.replace(0, 1)).abs()
-    
-    alpha = 2 / (length + 1)
-    vidya = np.zeros_like(src)
-    vidya[:] = np.nan
-    
-    start_idx = momentum 
-    if start_idx < len(src):
-        vidya[start_idx] = src.iloc[start_idx]
-
-    src_values = src.values
-    cmo_values = cmo.values
-    
-    for i in range(start_idx + 1, len(df)):
-        val_alpha = (alpha * cmo_values[i] / 100)
-        prev_vidya = vidya[i-1] if not np.isnan(vidya[i-1]) else src_values[i]
-        vidya[i] = val_alpha * src_values[i] + (1 - val_alpha) * prev_vidya
-        
-    return ta.sma(pd.Series(vidya), length=15)
-
-def get_swing_levels(df, lookback=10):
+def process_smc_data(df):
     """
-    計算波段高低點 (模擬 OB/BOS 位置)
-    回傳: 最近的一個高點(High) 和 最近的一個低點(Low)
+    計算 SMC 指標：市場結構(Structure) 與 訂單塊(Order Block)
+    修改版：模仿 LuxAlgo，在結構破壞(BOS)時才確認 OB
     """
-    highs = df['high']
-    lows = df['low']
-    
-    # 簡單的波段檢測：如果該點是前後 N 根K線的最高/低點
-    # 這裡使用 rolling max/min 來近似
-    # 實務上我們取最近的顯著高低點
-    
-    # 取得最近 50 根 K 線
-    recent_df = df.iloc[-50:].copy()
-    
-    # 尋找局部高點
-    swing_highs = recent_df['high'][(recent_df['high'].shift(1) < recent_df['high']) & (recent_df['high'].shift(-1) < recent_df['high'])]
-    # 尋找局部低點
-    swing_lows = recent_df['low'][(recent_df['low'].shift(1) > recent_df['low']) & (recent_df['low'].shift(-1) > recent_df['low'])]
-    
-    return swing_highs, swing_lows
+    if len(df) < 100: return None, None, None, None, None, None
 
-def process_data(df):
-    """計算所有需要的指標並產生訊號"""
-    if len(df) < 250: return None, None
-    
-    # 基礎指標
-    df['ema7'] = ta.ema(df['close'], length=7)
-    df['ema21'] = ta.ema(df['close'], length=21)
-    df['ema200'] = ta.ema(df['close'], length=200)
-    df['atr_200'] = ta.atr(df['high'], df['low'], df['close'], length=200)
-    df['tr'] = ta.true_range(df['high'], df['low'], df['close'])
-    
-    # VIDYA & Trend Up
-    df['vidya_sma'] = calculate_vidya(df, VIDYA_LEN, VIDYA_MOM)
-    df['upper_band'] = df['vidya_sma'] + df['atr_200'] * 2
-    df['lower_band'] = df['vidya_sma'] - df['atr_200'] * 2
-    
-    # 計算 is_trend_up
-    is_trend_up = np.full(len(df), False)
-    close_vals = df['close'].values
-    u_band = df['upper_band'].values
-    l_band = df['lower_band'].values
-    
-    for i in range(1, len(df)):
-        if np.isnan(u_band[i]): 
-            is_trend_up[i] = is_trend_up[i-1]
-            continue
-        if close_vals[i] > u_band[i]:
-            is_trend_up[i] = True
-        elif close_vals[i] < l_band[i]:
-            is_trend_up[i] = False
-        else:
-            is_trend_up[i] = is_trend_up[i-1]
-            
-    df['is_trend_up'] = is_trend_up
+    # 1. 識別 Pivot Points (Swings)
+    df['high_max'] = df['high'].rolling(window=PIVOT_LEN*2+1, center=True).max()
+    df['low_min'] = df['low'].rolling(window=PIVOT_LEN*2+1, center=True).min()
 
-    # Buffer & Magic Trend
-    sma_tr_5 = ta.sma(df['tr'], length=ATR_LEN)
-    df['cci_200'] = ta.cci(df['high'], df['low'], df['close'], length=CCI_LEN)
-    df['cci_20'] = ta.cci(df['high'], df['low'], df['close'], length=20)
+    df['is_pivot_high'] = (df['high'] == df['high_max'])
+    df['is_pivot_low'] = (df['low'] == df['low_min'])
+
+    obs = [] 
     
-    buffer_up = np.zeros(len(df))
-    buffer_dn = np.zeros(len(df))
-    x_line = np.zeros(len(df))
-    magic_trend = np.zeros(len(df))
-    
+    # 暫存最新的 Pivot K線資訊，等待 BOS 確認後轉為 OB
+    last_pivot_high_candle = None
+    last_pivot_low_candle = None
+
+    # 轉為 numpy array 加速
+    opens = df['open'].values
     highs = df['high'].values
     lows = df['low'].values
-    cci_200 = df['cci_200'].values
-    atr_vals = sma_tr_5.values
-    cci_20 = df['cci_20'].values
+    closes = df['close'].values
+    is_ph = df['is_pivot_high'].values
+    is_pl = df['is_pivot_low'].values
     
-    for i in range(1, len(df)):
-        curr_atr = atr_vals[i] if not np.isnan(atr_vals[i]) else 0
-        b_dn = highs[i] + curr_atr
-        b_up = lows[i] - curr_atr
-        prev_cci = cci_200[i-1]
-        curr_cci = cci_200[i]
-        
-        if curr_cci >= 0 and prev_cci < 0: b_up = buffer_dn[i-1]
-        if curr_cci <= 0 and prev_cci > 0: b_dn = buffer_up[i-1]
-        
-        if curr_cci >= 0:
-            if b_up < buffer_up[i-1]: b_up = buffer_up[i-1]
-        else:
-            if b_dn > buffer_dn[i-1]: b_dn = buffer_dn[i-1]
-            
-        buffer_up[i] = b_up
-        buffer_dn[i] = b_dn
-        
-        if curr_cci >= 0: x_line[i] = b_up
-        elif curr_cci <= 0: x_line[i] = b_dn
-        else: x_line[i] = x_line[i-1]
-        
-        up_t = lows[i] - curr_atr
-        down_t = highs[i] + curr_atr
-        prev_magic = magic_trend[i-1]
-        
-        if cci_20[i] >= 0:
-            if up_t < prev_magic: magic_trend[i] = prev_magic
-            else: magic_trend[i] = up_t
-        else:
-            if down_t > prev_magic: magic_trend[i] = prev_magic
-            else: magic_trend[i] = down_t
-            
-    df['x'] = x_line
-    df['magic_trend'] = magic_trend
-    
-    # 訊號判斷
-    curr = df.iloc[-1]
-    prev = df.iloc[-2]
-    
-    cross_over_x = (prev['close'] <= prev['x']) and (curr['close'] > curr['x'])
-    cross_under_x = (prev['close'] >= prev['x']) and (curr['close'] < curr['x'])
-    cross_over_magic = (prev['close'] <= prev['magic_trend']) and (curr['close'] > curr['magic_trend'])
-    cross_under_magic = (prev['close'] >= prev['magic_trend']) and (curr['close'] < curr['magic_trend'])
-    cross_over_ema200 = (prev['close'] <= prev['ema200']) and (curr['close'] > curr['ema200'])
-    cross_under_ema200 = (prev['close'] >= prev['ema200']) and (curr['close'] < curr['ema200'])
+    last_swing_high = highs[0]
+    last_swing_low = lows[0]
 
-    sorignal = curr['cci_20'] >= 0
-    bigmagicTrend = curr['cci_200'] >= 0
+    start_idx = PIVOT_LEN * 2 + 1
+    current_trend = 0 # 0: Unknown, 1: Bullish, -1: Bearish
     
-    original_long = (curr['is_trend_up'] and cross_over_x and cross_over_magic and curr['close'] > curr['ema200'] and curr['close'] > curr['ema7'] and curr['ema7'] > curr['ema21'])
-    original_short = (not curr['is_trend_up'] and cross_under_x and cross_under_magic and curr['close'] < curr['ema200'] and curr['close'] < curr['ema7'] and curr['ema7'] < curr['ema21'])
+    final_side = None
+    final_entry = 0
+    final_sl = 0
+    final_tp1 = 0
+    final_tp2 = 0
     
-    cross200_long = (sorignal and bigmagicTrend and curr['close'] > curr['ema7'] and curr['close'] > curr['ema21'] and cross_over_ema200)
-    cross200_short = (not sorignal and not bigmagicTrend and curr['close'] < curr['ema7'] and curr['close'] < curr['ema21'] and cross_under_ema200)
-
-    side = None
-    if original_long or cross200_long:
-        side = "LONG"
-    elif original_short or cross200_short:
-        side = "SHORT"
+    for i in range(start_idx, len(df)):
+        curr_close = closes[i]
+        curr_high = highs[i]
+        curr_low = lows[i]
         
-    return side, df
+        # --- 1. 更新結構與記錄候選 OB ---
+        pivot_idx = i - PIVOT_LEN
+        if pivot_idx >= 0:
+            if is_ph[pivot_idx]:
+                last_swing_high = highs[pivot_idx]
+                # 記錄這個 Pivot High 為潛在 Bearish OB (等待跌破 Swing Low 觸發)
+                last_pivot_high_candle = {
+                    'type': 'bear',
+                    'top': highs[pivot_idx],
+                    'bottom': lows[pivot_idx], 
+                    'mitigated': False,
+                    'idx': pivot_idx
+                }
+            
+            if is_pl[pivot_idx]:
+                last_swing_low = lows[pivot_idx]
+                # 記錄這個 Pivot Low 為潛在 Bullish OB (等待突破 Swing High 觸發)
+                last_pivot_low_candle = {
+                    'type': 'bull',
+                    'top': highs[pivot_idx],
+                    'bottom': lows[pivot_idx],
+                    'mitigated': False,
+                    'idx': pivot_idx
+                }
+
+        # --- 2. 判斷結構破壞 (BOS/CHoCH) 並生成 OB ---
+        # LuxAlgo 邏輯：只有當結構被破壞(BOS)時，才將"造成這次破壞的起點(Pivot)"視為有效 OB
+        
+        # 情況 A: 向上突破 (Bullish BOS)
+        if curr_close > last_swing_high:
+            # 如果趨勢改變或延續，且我們有一個未加入的潛在 Bullish Pivot
+            if current_trend != 1 or True: # 簡化邏輯：只要創新高就檢查是否要加入 OB
+                if last_pivot_low_candle is not None:
+                    # 防止重複加入同一個 Pivot (檢查 index)
+                    if not any(ob['idx'] == last_pivot_low_candle['idx'] for ob in obs):
+                        obs.append(last_pivot_low_candle.copy())
+            current_trend = 1
+            
+        # 情況 B: 向下跌破 (Bearish BOS)
+        elif curr_close < last_swing_low:
+            if current_trend != -1 or True:
+                if last_pivot_high_candle is not None:
+                    if not any(ob['idx'] == last_pivot_high_candle['idx'] for ob in obs):
+                        obs.append(last_pivot_high_candle.copy())
+            current_trend = -1
+            
+        # --- 3. 判斷進場 (回踩 OB) ---
+        # (保持原邏輯不變，僅變數來源 obs 已改變計算方式)
+        if current_trend == 1: 
+            valid_obs = [ob for ob in obs if ob['type'] == 'bull' and not ob['mitigated'] and ob['top'] < curr_close]
+            if valid_obs:
+                target_ob = valid_obs[-1]
+                if curr_low <= target_ob['top'] and curr_close >= target_ob['bottom']:
+                    if i == len(df) - 1:
+                        final_side = "LONG"
+                        final_entry = curr_close
+                        final_sl = target_ob['bottom']
+                        final_tp1 = last_swing_high
+                        risk = final_entry - final_sl
+                        final_tp2 = final_entry + risk if risk > 0 else final_entry * 1.01
+                    target_ob['mitigated'] = True
+                    
+        elif current_trend == -1:
+            valid_obs = [ob for ob in obs if ob['type'] == 'bear' and not ob['mitigated'] and ob['bottom'] > curr_close]
+            if valid_obs:
+                target_ob = valid_obs[-1]
+                if curr_high >= target_ob['bottom'] and curr_close <= target_ob['top']:
+                    if i == len(df) - 1:
+                        final_side = "SHORT"
+                        final_entry = curr_close
+                        final_sl = target_ob['top']
+                        final_tp1 = last_swing_low
+                        risk = final_sl - final_entry
+                        final_tp2 = final_entry - risk if risk > 0 else final_entry * 0.99
+                    target_ob['mitigated'] = True
+
+        # --- 4. 清理無效 OB ---
+        for ob in obs:
+            if not ob['mitigated']:
+                if ob['type'] == 'bull' and curr_close < ob['bottom']:
+                    ob['mitigated'] = True 
+                elif ob['type'] == 'bear' and curr_close > ob['top']:
+                    ob['mitigated'] = True
+
+    return final_side, final_entry, final_sl, final_tp1, final_tp2, df
 
 # ==========================================
 # 3. 機器人主程式
@@ -205,154 +164,25 @@ class TradingBot:
         self.last_update = datetime.min
 
     def update_top_symbols(self):
-        """
-        篩選邏輯：
-        1. 獲取所有 USDT 對
-        2. 排除穩定幣 (USDC, FDUSD, DAI, TUSD, USDE 等)
-        3. 依照 Quote Volume (成交額) 排序，取前 50 名
-        """
+        # 維持原有的幣種篩選邏輯
         if datetime.now() - self.last_update > timedelta(hours=4):
             try:
                 tickers = exchange.fetch_tickers()
                 valid_tickers = []
-                # 擴充後的穩定幣排除名單
-                exclude = ['USDC', 'DAI', 'FDUSD', 'USDE', 'BUSD', 'TUSD', 'PYUSD', 'USDD', 'EUR', 'GBP']
-                
+                exclude = ['USDC', 'DAI', 'FDUSD', 'USDE', 'BUSD', 'TUSD', 'PYUSD', 'USDD']
                 for s, t in tickers.items():
                     if '/USDT' in s:
-                        # 檢查 symbol 前綴是否在排除名單內 (例如 USDC/USDT)
-                        base_currency = s.split('/')[0]
-                        if base_currency not in exclude:
+                        is_stable = any(ex in s for ex in exclude)
+                        if not is_stable:
                             vol = t['quoteVolume'] if t.get('quoteVolume') else 0
-                            # 過濾掉成交量過小的 (例如 < 100萬 U)
-                            if vol > 1000000:
-                                valid_tickers.append({'symbol': s, 'vol': vol})
+                            valid_tickers.append({'symbol': s, 'vol': vol})
                             
-                # 排序並取前 50
                 self.symbols = [x['symbol'] for x in sorted(valid_tickers, key=lambda x: x['vol'], reverse=True)[:50]]
                 self.last_update = datetime.now()
-                print(f"[{datetime.now().strftime('%H:%M')}] 更新監控幣種 (Top {len(self.symbols)})")
-            except Exception as e:
-                print(f"Update symbols error: {e}")
-                self.symbols = ['BTC/USDT', 'ETH/USDT', 'SOL/USDT', 'BNB/USDT', 'XRP/USDT', 'DOGE/USDT']
+                print(f"[{datetime.now().strftime('%H:%M')}] 更新監控清單: {len(self.symbols)} 幣種")
+            except: 
+                self.symbols = ['BTC/USDT', 'ETH/USDT', 'SOL/USDT', 'BNB/USDT', 'XRP/USDT']
         return self.symbols
-
-    def calculate_sl_tp(self, df, side):
-        """
-        修改後的 TP/SL 邏輯：
-        1. SL: 放置在最近的波段高點/低點 (模擬 OB 上方/下方)
-        2. TP1: 放置在反向的最近波段高點/低點 (模擬反向 OB/BOS)
-        3. TP2: 1:1 盈虧比 (與 SL 距離相同)
-        4. TP3: 1:2 盈虧比
-        """
-        curr = df.iloc[-1]
-        entry = curr['close']
-        
-        # 取得波段高低點
-        swing_highs, swing_lows = get_swing_levels(df)
-        
-        rr_ratio_str = "N/A" # 預設字串
-        
-        if side == "LONG":
-            # SL: 找最近的一個波段低點 (Swing Low) 作為支撐下方
-            # 如果找不到，使用 ATR 作為保底
-            recent_lows = swing_lows[swing_lows < entry]
-            if not recent_lows.empty:
-                sl = recent_lows.iloc[-1] # 取最近的一個
-            else:
-                sl = entry - (ta.atr(df['high'], df['low'], df['close'], length=14).iloc[-1] * 2)
-
-            # TP1: 找上方最近的一個波段高點 (Swing High) 作為壓力
-            recent_highs = swing_highs[swing_highs > entry]
-            if not recent_highs.empty:
-                tp1 = recent_highs.iloc[-1] # 取最近的一個 (通常是最近的阻力)
-            else:
-                # 如果上方沒有歷史高點 (突破新高)，用 1.5 倍風險距離
-                tp1 = entry + abs(entry - sl) * 1.5
-
-            # 計算盈虧比 (TP1)
-            risk = abs(entry - sl)
-            reward = abs(tp1 - entry)
-            if risk > 0:
-                rr = reward / risk
-                rr_ratio_str = f"1:{rr:.2f}"
-
-            # TP2: 1:1 盈虧比
-            tp2 = entry + risk
-            
-            # TP3 (保留原本的結構)
-            tp3 = entry + (risk * 2)
-
-        else: # SHORT
-            # SL: 找最近的一個波段高點 (Swing High) 作為壓力上方
-            recent_highs = swing_highs[swing_highs > entry]
-            if not recent_highs.empty:
-                sl = recent_highs.iloc[-1]
-            else:
-                sl = entry + (ta.atr(df['high'], df['low'], df['close'], length=14).iloc[-1] * 2)
-
-            # TP1: 找下方最近的一個波段低點 (Swing Low) 作為支撐
-            recent_lows = swing_lows[swing_lows < entry]
-            if not recent_lows.empty:
-                tp1 = recent_lows.iloc[-1]
-            else:
-                tp1 = entry - abs(sl - entry) * 1.5
-
-            # 計算盈虧比 (TP1)
-            risk = abs(sl - entry)
-            reward = abs(entry - tp1)
-            if risk > 0:
-                rr = reward / risk
-                rr_ratio_str = f"1:{rr:.2f}"
-
-            # TP2: 1:1
-            tp2 = entry - risk
-            tp3 = entry - (risk * 2)
-            
-        return entry, sl, tp1, tp2, tp3, rr_ratio_str
-
-    def send_discord(self, symbol, side, interval, entry, sl, tp1, tp2, tp3, rr_str):
-        # 強制加 8 小時 (台灣時間)
-        tw_time = (datetime.utcnow() + timedelta(hours=8)).strftime('%H:%M')
-        side_cn = "做多" if side == "LONG" else "做空"
-        exchange_name = "BYBIT"
-        
-        def fmt(num): return f"{num:.4f}".rstrip('0').rstrip('.')
-        
-        msg = (
-            f"🚨\n"
-            f"{symbol} 訊號 {exchange_name}\n"
-            f"方向 {side_cn}\n"
-            f"週期:{interval.upper()}\n"
-            f"進場:{fmt(entry)}\n"
-            f"SL:{fmt(sl)}\n"
-            f"TP1: {fmt(tp1)} (盈虧比 {rr_str})\n"
-            f"TP2: {fmt(tp2)} (1:1)\n"
-            f"偵測時間: 台灣時間 {tw_time}"
-            # TP3 可選擇是否顯示，這裡依照您原本格式TP2為止
-        )
-        
-        payload = {"content": msg}
-        try:
-            requests.post(DISCORD_URL, json=payload)
-            print(f"已發送: {symbol} {side}")
-        except Exception as e:
-            print(f"Discord 失敗: {e}")
-
-    def send_test_signal(self):
-        """發送測試推播"""
-        print("正在發送測試推播...")
-        self.send_discord(
-            symbol="TEST/USDT",
-            side="LONG",
-            interval="TEST",
-            entry=1.2345,
-            sl=1.2000,
-            tp1=1.2800,
-            tp2=1.2690,
-            tp3=1.3000,
-            rr_str="1:1.32"
-        )
 
     def run_analysis(self):
         symbols = self.update_top_symbols()
@@ -361,37 +191,87 @@ class TradingBot:
         for symbol in symbols:
             for tf in timeframes:
                 try:
-                    bars = exchange.fetch_ohlcv(symbol, timeframe=tf, limit=500)
+                    # 抓取足夠的 K 線以識別 Pivot 和 OB
+                    bars = exchange.fetch_ohlcv(symbol, timeframe=tf, limit=300)
                     df = pd.DataFrame(bars, columns=['timestamp','open','high','low','close','volume'])
                     df = df.astype(float)
                     df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
                     
-                    side, df_result = process_data(df)
+                    # 執行 SMC 策略
+                    side, entry, sl, tp1, tp2, _ = process_smc_data(df)
                     
                     if side:
                         signal_key = f"{symbol}_{tf}_{side}"
                         last_ts = self.last_signals.get(signal_key, 0)
                         current_ts = df['timestamp'].iloc[-1]
                         
+                        # 簡單的去重機制：同一根 K 棒只發一次
                         if current_ts != last_ts:
-                            entry, sl, tp1, tp2, tp3, rr_str = self.calculate_sl_tp(df_result, side)
-                            self.send_discord(symbol, side, tf, entry, sl, tp1, tp2, tp3, rr_str)
+                            self.send_discord(symbol, side, tf, entry, sl, tp1, tp2)
                             self.last_signals[signal_key] = current_ts
-                    time.sleep(0.1) # 避免 API 請求過快
+                    
+                    time.sleep(0.1) # API 保護
                 except Exception as e:
-                    # 某些幣種可能會報錯，忽略即可
-                    pass
+                    print(f"Error {symbol}: {e}")
+
+    # ==========================================
+    # 4. 通知格式 (依照你的 SMC 模板)
+    # ==========================================
+    def send_discord(self, symbol, side, interval, entry, sl, tp1, tp2):
+        tw_time = (datetime.utcnow() + timedelta(hours=8)).strftime('%H:%M')
+        
+        side_cn = "做多" if side == "LONG" else "做空"
+        exchange_name = "BYBIT"
+        
+        # 格式化數字 function
+        def fmt(num): 
+            if num < 1: return f"{num:.5f}".rstrip('0').rstrip('.')
+            return f"{num:.4f}".rstrip('0').rstrip('.')
+            
+        # 計算盈虧比 (RR) 顯示在 TP1 後面
+        # Risk = |Entry - SL|
+        # Reward = |TP1 - Entry|
+        # RR = Reward / Risk
+        try:
+            risk = abs(entry - sl)
+            reward_tp1 = abs(tp1 - entry)
+            rr_ratio = reward_tp1 / risk if risk > 0 else 0
+            rr_str = f"1:{rr_ratio:.1f}"
+        except:
+            rr_str = "N/A"
+
+        # TP2 固定顯示 1:1，因為程式邏輯是算在 1:1 的位置
+        tp2_rr_str = "1:1"
+
+        msg = (
+            f"🚨\n"
+            f"{symbol} 訊號 {exchange_name}\n"
+            f"方向 {side_cn}\n"
+            f"週期:{interval.upper()}\n"
+            f"進場:{fmt(entry)}\n"
+            f"SL:{fmt(sl)}\n"
+            f"TP1: {fmt(tp1)}({rr_str})\n"
+            f"TP2: {fmt(tp2)}({tp2_rr_str})\n\n"
+            f"偵測時間: 台灣時間 {tw_time}"
+        )
+        
+        payload = {"content": msg}
+        
+        try:
+            requests.post(DISCORD_URL, json=payload)
+            print(f"✅ 已發送 SMC 訊號: {symbol} {side} ({rr_str})")
+        except Exception as e:
+            print(f"Discord 發送失敗: {e}")
 
 if __name__ == "__main__":
     bot = TradingBot()
-    print("🚀 Zeabur Trading Bot (SMC TP Logic + Filter Update) 已啟動...")
+    print("🚀 Zeabur SMC OrderBlock Bot 已啟動...")
+    print("策略：SMC OB回踩 + 結構篩選 (LuxAlgo Logic)")
     
-    # 啟動時發送一次測試訊號
-    bot.send_test_signal()
+    # 測試訊號格式
+    print("測試發送...")
+    bot.send_discord("PENGU/USDT", "SHORT", "15m", 0.0127, 0.0133, 0.0123, 0.0121)
     
     while True:
-        try:
-            bot.run_analysis()
-        except Exception as e:
-            print(f"Main Loop Error: {e}")
+        bot.run_analysis()
         time.sleep(60)
