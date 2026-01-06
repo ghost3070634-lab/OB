@@ -10,7 +10,7 @@ from datetime import datetime, timedelta
 # ==========================================
 # 1. 配置設定
 # ==========================================
-DISCORD_URL = os.getenv("DISCORD_WEBHOOK_URL", "https://discord.com/api/webhooks/1457246379242950797/LB6npSWu5J9ZbB8NYp90N-gpmDrjOK2qPqtkaB5AP6YztzdfzmBF6oxesKJybWQ04xoU")
+DISCORD_URL = os.getenv("DISCORD_WEBHOOK_URL", "https://discord.com/api/webhooks/1458076152504520771/HZoL7eh3KpncZW7zbZEqBMqM0SHJDczVXmCBJHv9QuXV8qfLlEUPCCDs-Z4LnLcaGQ_B")
 
 exchange = ccxt.bybit({
     'enableRateLimit': True,
@@ -186,7 +186,7 @@ class TradingBot:
 
     def run_analysis(self):
         symbols = self.update_top_symbols()
-        timeframes = ['15m', '30m', '1h']
+        timeframes = ['30m', '1h','4H' ]
         
         for symbol in symbols:
             for tf in timeframes:
