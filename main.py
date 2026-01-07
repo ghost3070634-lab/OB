@@ -17,19 +17,17 @@ exchange = ccxt.bybit({
     'options': {'defaultType': 'spot'}
 })
 
-# SMC 參數
-PIVOT_LEN = 5  # 定義碎形(Fractal)的左右 K 線數量，用於判斷 OB 和結構
+# ==========================================
+# 修改點 1：加大碎形長度
+# 原本 = 5 (Internal 結構，太敏感)
+# 修改 = 10 (Swing 結構，接近 LuxAlgo 的大結構)
+# ==========================================
+PIVOT_LEN = 10  
 
 # ==========================================
-# 2. SMC 策略核心邏輯 (LuxAlgo 邏輯 + 掛單進場模式)
+# 2. SMC 策略核心邏輯
 # ==========================================
 def process_smc_data(df):
-    """
-    計算 SMC 指標：市場結構(Structure) 與 訂單塊(Order Block)
-    修改版：
-    1. BOS 觸發 OB
-    2. 進場點改為 OB 的邊界 (掛單邏輯)，不等待收盤確認
-    """
     if len(df) < 100: return None, None, None, None, None, None
 
     # 1. 識別 Pivot Points (Swings)
@@ -41,7 +39,6 @@ def process_smc_data(df):
 
     obs = [] 
     
-    # 暫存最新的 Pivot K線資訊
     last_pivot_high_candle = None
     last_pivot_low_candle = None
 
@@ -51,11 +48,12 @@ def process_smc_data(df):
     is_ph = df['is_pivot_high'].values
     is_pl = df['is_pivot_low'].values
     
+    # 這裡可以優化：初始值設為 None，避免第一根K棒干擾
     last_swing_high = highs[0]
     last_swing_low = lows[0]
 
     start_idx = PIVOT_LEN * 2 + 1
-    current_trend = 0 # 0: Unknown, 1: Bullish, -1: Bearish
+    current_trend = 0 
     
     final_side = None
     final_entry = 0
@@ -92,17 +90,19 @@ def process_smc_data(df):
                 }
 
         # --- 2. 判斷結構破壞 (BOS) 並生成 OB ---
-        # 情況 A: 向上突破 (Bullish BOS)
+        
+        # Bullish BOS (向上突破)
         if curr_close > last_swing_high:
-            if current_trend != 1 or True:
+            if current_trend != 1: # 趨勢剛翻轉時
                 if last_pivot_low_candle is not None:
+                    # 避免重複添加
                     if not any(ob['idx'] == last_pivot_low_candle['idx'] for ob in obs):
                         obs.append(last_pivot_low_candle.copy())
             current_trend = 1
             
-        # 情況 B: 向下跌破 (Bearish BOS)
+        # Bearish BOS (向下跌破)
         elif curr_close < last_swing_low:
-            if current_trend != -1 or True:
+            if current_trend != -1: # 趨勢剛翻轉時
                 if last_pivot_high_candle is not None:
                     if not any(ob['idx'] == last_pivot_high_candle['idx'] for ob in obs):
                         obs.append(last_pivot_high_candle.copy())
@@ -110,54 +110,55 @@ def process_smc_data(df):
             
         # --- 3. 判斷進場 (回踩 OB - 掛單邏輯) ---
         
-        # [做多] 支撐 OB
+        # [做多] 必須是 Bullish 趨勢
         if current_trend == 1: 
-            # 尋找有效的 Bullish OB
+            # 找出尚未測試的 Bullish OB
+            # 過濾條件加嚴：OB 必須在當前價格下方一定距離 (避免剛形成就觸發)
             valid_obs = [ob for ob in obs if ob['type'] == 'bull' and not ob['mitigated'] and ob['top'] < curr_close]
+            
             if valid_obs:
+                # 取最近的一個 OB
                 target_ob = valid_obs[-1]
                 
-                # 修改：只要最低價 (Low) 碰到 OB 的高點 (Top) 即視為觸發
-                # 進場點 = OB 的高點
+                # 觸發條件：最低價碰到 OB 上緣
                 if curr_low <= target_ob['top']:
+                    # 這裡是為了避免回測時重複觸發，只在最後一根K線發送訊號
                     if i == len(df) - 1:
                         final_side = "LONG"
-                        final_entry = target_ob['top'] # 進場點設為 OB 上緣
-                        final_sl = target_ob['bottom'] # 止損設為 OB 下緣
-                        final_tp1 = last_swing_high
+                        final_entry = target_ob['top'] # 掛單在 OB 上緣
+                        final_sl = target_ob['bottom'] # 止損在 OB 下緣
+                        final_tp1 = last_swing_high    # 止盈在前高
                         
-                        # 計算 TP2 (1:1)
                         risk = final_entry - final_sl
                         final_tp2 = final_entry + risk if risk > 0 else final_entry * 1.01
                         
                     target_ob['mitigated'] = True
         
-        # [做空] 壓力 OB
+        # [做空] 必須是 Bearish 趨勢
         elif current_trend == -1:
-            # 尋找有效的 Bearish OB
+            # 找出尚未測試的 Bearish OB
             valid_obs = [ob for ob in obs if ob['type'] == 'bear' and not ob['mitigated'] and ob['bottom'] > curr_close]
+            
             if valid_obs:
                 target_ob = valid_obs[-1]
                 
-                # 修改：只要最高價 (High) 碰到 OB 的低點 (Bottom) 即視為觸發
-                # 進場點 = OB 的低點
+                # 觸發條件：最高價碰到 OB 下緣
                 if curr_high >= target_ob['bottom']:
                     if i == len(df) - 1:
                         final_side = "SHORT"
-                        final_entry = target_ob['bottom'] # 進場點設為 OB 下緣
-                        final_sl = target_ob['top']       # 止損設為 OB 上緣
-                        final_tp1 = last_swing_low
+                        final_entry = target_ob['bottom'] # 掛單在 OB 下緣
+                        final_sl = target_ob['top']       # 止損在 OB 上緣
+                        final_tp1 = last_swing_low    # 止盈在前低 (這就是你圖上的黃線 Strong Low)
                         
-                        # 計算 TP2 (1:1)
                         risk = final_sl - final_entry
                         final_tp2 = final_entry - risk if risk > 0 else final_entry * 0.99
                         
                     target_ob['mitigated'] = True
 
         # --- 4. 清理無效 OB ---
+        # 如果價格直接貫穿 OB，則該 OB 失效
         for ob in obs:
             if not ob['mitigated']:
-                # 若價格完全穿過 OB 則視為失效
                 if ob['type'] == 'bull' and curr_close < ob['bottom']:
                     ob['mitigated'] = True 
                 elif ob['type'] == 'bear' and curr_close > ob['top']:
@@ -196,7 +197,6 @@ class TradingBot:
 
     def run_analysis(self):
         symbols = self.update_top_symbols()
-        # Bybit 必須使用小寫週期 '4h'
         timeframes = ['30m', '1h', '4h'] 
         
         for symbol in symbols:
@@ -222,9 +222,6 @@ class TradingBot:
                 except Exception as e:
                     print(f"Error {symbol}: {e}")
 
-    # ==========================================
-    # 4. 通知格式
-    # ==========================================
     def send_discord(self, symbol, side, interval, entry, sl, tp1, tp2):
         tw_time = (datetime.utcnow() + timedelta(hours=8)).strftime('%H:%M')
         
@@ -267,11 +264,11 @@ class TradingBot:
 
 if __name__ == "__main__":
     bot = TradingBot()
-    print("🚀 Zeabur SMC OrderBlock Bot (Limit Entry) 已啟動...")
-    print("策略：SMC OB 觸碰即進場 (Entry = OB Edge)")
+    print("🚀 Zeabur SMC OrderBlock Bot (Swing Mode) 已啟動...")
+    print("策略：大結構 OB 觸碰進場 (PIVOT_LEN=10)")
     
-    # 測試訊號格式
-    bot.send_discord("TEST/USDT", "SHORT", "4H", 0.0127, 0.0133, 0.0123, 0.0121)
+    # 測試訊號
+    bot.send_discord("PENGU/USDT", "SHORT", "15m", 0.0127, 0.0133, 0.0123, 0.0121)
     
     while True:
         bot.run_analysis()
