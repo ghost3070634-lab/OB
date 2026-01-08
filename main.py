@@ -298,3 +298,4 @@ if __name__ == "__main__":
     while True:
         bot.run_analysis()
         time.sleep(60)
+
