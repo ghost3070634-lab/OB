@@ -5,7 +5,6 @@ import numpy as np
 import time
 import requests
 import os
-# 修改 1: 引入 timezone
 from datetime import datetime, timedelta, timezone
 
 # ==========================================
@@ -20,17 +19,16 @@ exchange = ccxt.bybit({
 
 # ==========================================
 # 參數設定
-# PIVOT_LEN = 10 (Swing 結構，接近 LuxAlgo 的大結構)
 # ==========================================
 PIVOT_LEN = 10  
 
 # ==========================================
-# 2. SMC 策略核心邏輯
+# 2. SMC 策略核心邏輯 (支援連續 BOS)
 # ==========================================
 def process_smc_data(df):
-    if len(df) < 100: return None, None, None, None, None, None
+    if len(df) < 100: return None, None, None, None, None, None, None
 
-    # 1. 識別 Pivot Points (Swings)
+    # 1. 識別 Pivot Points
     df['high_max'] = df['high'].rolling(window=PIVOT_LEN*2+1, center=True).max()
     df['low_min'] = df['low'].rolling(window=PIVOT_LEN*2+1, center=True).min()
 
@@ -54,18 +52,22 @@ def process_smc_data(df):
     start_idx = PIVOT_LEN * 2 + 1
     current_trend = 0 
     
+    # 新增：趨勢內的 OB 計數器
+    trend_ob_counter = 0 
+    
     final_side = None
     final_entry = 0
     final_sl = 0
     final_tp1 = 0
     final_tp2 = 0
+    final_seq = 0 # 最終訊號是第幾個 OB
     
     for i in range(start_idx, len(df)):
         curr_close = closes[i]
         curr_high = highs[i]
         curr_low = lows[i]
         
-        # --- 1. 更新結構與記錄候選 OB ---
+        # --- 1. 更新結構 (Pivots) ---
         pivot_idx = i - PIVOT_LEN
         if pivot_idx >= 0:
             if is_ph[pivot_idx]:
@@ -75,7 +77,8 @@ def process_smc_data(df):
                     'top': highs[pivot_idx],
                     'bottom': lows[pivot_idx], 
                     'mitigated': False,
-                    'idx': pivot_idx
+                    'idx': pivot_idx,
+                    'seq': 0 # 暫時佔位
                 }
             
             if is_pl[pivot_idx]:
@@ -85,51 +88,80 @@ def process_smc_data(df):
                     'top': highs[pivot_idx],
                     'bottom': lows[pivot_idx],
                     'mitigated': False,
-                    'idx': pivot_idx
+                    'idx': pivot_idx,
+                    'seq': 0 # 暫時佔位
                 }
 
-        # --- 2. 判斷結構破壞 (BOS) 並生成 OB ---
+        # --- 2. 判斷結構破壞 (BOS / MSS) ---
         
-        # Bullish BOS (向上突破)
+        # Bullish Break (向上突破)
         if curr_close > last_swing_high:
             if current_trend != 1:
-                if last_pivot_low_candle is not None:
-                    if not any(ob['idx'] == last_pivot_low_candle['idx'] for ob in obs):
-                        obs.append(last_pivot_low_candle.copy())
-            current_trend = 1
+                # 趨勢反轉 (MSS)，計數重置為 1
+                current_trend = 1
+                trend_ob_counter = 1
+            else:
+                # 趨勢延續 (BOS)，計數 +1
+                trend_ob_counter += 1
+                
+            # 無論是 MSS 還是 BOS，只要有新的突破，就嘗試記錄 OB
+            if last_pivot_low_candle is not None:
+                # 檢查是否已經存在 (避免同一根 K 棒重複加入)
+                if not any(ob['idx'] == last_pivot_low_candle['idx'] for ob in obs):
+                    new_ob = last_pivot_low_candle.copy()
+                    new_ob['seq'] = trend_ob_counter # 寫入是第幾個 OB
+                    obs.append(new_ob)
             
-        # Bearish BOS (向下跌破)
+        # Bearish Break (向下跌破)
         elif curr_close < last_swing_low:
             if current_trend != -1:
-                if last_pivot_high_candle is not None:
-                    if not any(ob['idx'] == last_pivot_high_candle['idx'] for ob in obs):
-                        obs.append(last_pivot_high_candle.copy())
-            current_trend = -1
+                # 趨勢反轉 (MSS)，計數重置為 1
+                current_trend = -1
+                trend_ob_counter = 1
+            else:
+                # 趨勢延續 (BOS)，計數 +1
+                trend_ob_counter += 1
+                
+            # 記錄 OB
+            if last_pivot_high_candle is not None:
+                if not any(ob['idx'] == last_pivot_high_candle['idx'] for ob in obs):
+                    new_ob = last_pivot_high_candle.copy()
+                    new_ob['seq'] = trend_ob_counter # 寫入是第幾個 OB
+                    obs.append(new_ob)
             
-        # --- 3. 判斷進場 (回踩 OB - 掛單邏輯) ---
+        # --- 3. 判斷進場 (回踩 OB) ---
         
         # [做多]
         if current_trend == 1: 
+            # 找出有效的 Bullish OB
             valid_obs = [ob for ob in obs if ob['type'] == 'bull' and not ob['mitigated'] and ob['top'] < curr_close]
             
             if valid_obs:
+                # 取最新的 OB (通常是最近形成的那個)
                 target_ob = valid_obs[-1]
+                
+                # 價格回踩進場區域
                 if curr_low <= target_ob['top']:
                     if i == len(df) - 1:
                         final_side = "LONG"
                         final_entry = target_ob['top']
                         final_sl = target_ob['bottom']
                         final_tp1 = last_swing_high
+                        # 計算 TP2 (Risk:Reward)
                         risk = final_entry - final_sl
                         final_tp2 = final_entry + risk if risk > 0 else final_entry * 1.01
+                        final_seq = target_ob['seq'] # 記錄这是第几个 OB
+                        
                     target_ob['mitigated'] = True
         
         # [做空]
         elif current_trend == -1:
+            # 找出有效的 Bearish OB
             valid_obs = [ob for ob in obs if ob['type'] == 'bear' and not ob['mitigated'] and ob['bottom'] > curr_close]
             
             if valid_obs:
                 target_ob = valid_obs[-1]
+                
                 if curr_high >= target_ob['bottom']:
                     if i == len(df) - 1:
                         final_side = "SHORT"
@@ -138,17 +170,22 @@ def process_smc_data(df):
                         final_tp1 = last_swing_low
                         risk = final_sl - final_entry
                         final_tp2 = final_entry - risk if risk > 0 else final_entry * 0.99
+                        final_seq = target_ob['seq'] # 記錄这是第几个 OB
+                        
                     target_ob['mitigated'] = True
 
-        # --- 4. 清理無效 OB ---
+        # --- 4. 清理無效 OB (Break through) ---
         for ob in obs:
             if not ob['mitigated']:
+                # 如果做多 OB 被跌破 SL，失效
                 if ob['type'] == 'bull' and curr_close < ob['bottom']:
                     ob['mitigated'] = True 
+                # 如果做空 OB 被漲破 SL，失效
                 elif ob['type'] == 'bear' and curr_close > ob['top']:
                     ob['mitigated'] = True
 
-    return final_side, final_entry, final_sl, final_tp1, final_tp2, df
+    # 回傳多了 final_seq
+    return final_side, final_entry, final_sl, final_tp1, final_tp2, final_seq, df
 
 # ==========================================
 # 3. 機器人主程式
@@ -191,27 +228,30 @@ class TradingBot:
                     df = df.astype(float)
                     df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
                     
-                    side, entry, sl, tp1, tp2, _ = process_smc_data(df)
+                    # 接收 7 個回傳值 (多了 ob_seq)
+                    side, entry, sl, tp1, tp2, ob_seq, _ = process_smc_data(df)
                     
                     if side:
-                        signal_key = f"{symbol}_{tf}_{side}"
+                        signal_key = f"{symbol}_{tf}_{side}_{ob_seq}" # Key 加入 seq，避免同一方向不同 OB 重複過濾
                         last_ts = self.last_signals.get(signal_key, 0)
                         current_ts = df['timestamp'].iloc[-1]
                         
                         if current_ts != last_ts:
-                            self.send_discord(symbol, side, tf, entry, sl, tp1, tp2)
+                            self.send_discord(symbol, side, tf, entry, sl, tp1, tp2, ob_seq)
                             self.last_signals[signal_key] = current_ts
                     
                     time.sleep(0.1) 
                 except Exception as e:
                     print(f"Error {symbol}: {e}")
 
-    def send_discord(self, symbol, side, interval, entry, sl, tp1, tp2):
-        # 修改 2: 使用 timezone.utc 來修復 DeprecationWarning
-        # datetime.now(timezone.utc) 獲取當前 UTC 時間，再加上 8 小時
+    def send_discord(self, symbol, side, interval, entry, sl, tp1, tp2, ob_seq):
+        # UTC+8
         tw_time = (datetime.now(timezone.utc) + timedelta(hours=8)).strftime('%H:%M')
         
+        # 顯示格式修改：加入 (seq)
         side_cn = "做多" if side == "LONG" else "做空"
+        side_display = f"{side_cn}({ob_seq})"
+        
         exchange_name = "BYBIT"
         
         def fmt(num): 
@@ -228,10 +268,10 @@ class TradingBot:
 
         tp2_rr_str = "1:1"
 
+        # 這裡完全按照你的新格式要求
         msg = (
-            f"🚨\n"
             f"{symbol} 訊號 {exchange_name}\n"
-            f"方向 {side_cn}\n"
+            f"方向 {side_display}\n"
             f"週期:{interval.upper()}\n"
             f"進場:{fmt(entry)}\n"
             f"SL:{fmt(sl)}\n"
@@ -244,17 +284,16 @@ class TradingBot:
         
         try:
             requests.post(DISCORD_URL, json=payload)
-            print(f"✅ 已發送 SMC 訊號: {symbol} {side} ({rr_str})")
+            print(f"✅ 已發送: {symbol} {side_display}")
         except Exception as e:
             print(f"Discord 發送失敗: {e}")
 
 if __name__ == "__main__":
     bot = TradingBot()
-    print("🚀 Zeabur SMC OrderBlock Bot (Fix Timezone) 已啟動...")
-    print(f"策略參數: PIVOT_LEN={PIVOT_LEN}")
+    print("🚀 Zeabur SMC Bot (支援連續BOS + OB計數) 已啟動...")
     
-    # 測試訊號
-    bot.send_discord("TEST/USDT", "LONG", "1h", 1.2345, 1.2000, 1.3000, 1.2690)
+    # 測試訊號 (模擬第 3 個 OB)
+    bot.send_discord("TEST/USDT", "LONG", "30m", 627.3, 622.2, 653.3, 632.4, 3)
     
     while True:
         bot.run_analysis()
