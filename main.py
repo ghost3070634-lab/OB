@@ -20,7 +20,7 @@ exchange = ccxt.bybit({
 PIVOT_LEN = 10  
 
 # ==========================================
-# 2. SMC 策略核心邏輯 (含 OB 計數)
+# 2. SMC 策略核心邏輯 (修正計數暴增問題)
 # ==========================================
 def process_smc_data(df):
     if len(df) < 100: return None, None, None, None, None, None, None
@@ -46,19 +46,21 @@ def process_smc_data(df):
     last_swing_high = highs[0]
     last_swing_low = lows[0]
 
+    # --- 新增：紀錄上一次被突破的價格，防止同一個結構重複計數 ---
+    last_broken_high = -1
+    last_broken_low = -1
+
     start_idx = PIVOT_LEN * 2 + 1
     
-    # 狀態變數
-    current_trend = 0      # 1=多頭, -1=空頭
-    trend_seq = 0          # 目前是趨勢中的第幾個 OB
+    current_trend = 0      
+    trend_seq = 0          
     
-    # 最終訊號變數
     final_side = None
     final_entry = 0
     final_sl = 0
     final_tp1 = 0
     final_tp2 = 0
-    final_ob_seq = 0       # 用來回傳該訊號是第幾個 OB
+    final_ob_seq = 0      
     
     for i in range(start_idx, len(df)):
         curr_close = closes[i]
@@ -76,7 +78,7 @@ def process_smc_data(df):
                     'bottom': lows[pivot_idx], 
                     'mitigated': False,
                     'idx': pivot_idx,
-                    'seq': 0 # 之後會填入
+                    'seq': 0 
                 }
             
             if is_pl[pivot_idx]:
@@ -87,88 +89,94 @@ def process_smc_data(df):
                     'bottom': lows[pivot_idx],
                     'mitigated': False,
                     'idx': pivot_idx,
-                    'seq': 0 # 之後會填入
+                    'seq': 0 
                 }
 
         # --- B. 判斷結構破壞 (MSS / BOS) ---
         
-        # === 向上突破 (潛在多頭) ===
+        # === 向上突破 (Break High) ===
         if curr_close > last_swing_high:
-            # 判斷是 MSS 還是 BOS
-            if current_trend != 1:
-                # 趨勢從 空/無 -> 多 (MSS)
-                current_trend = 1
-                trend_seq = 1  # 重置計數為 1
-            else:
-                # 趨勢維持多頭 (BOS)
-                trend_seq += 1 # 計數遞增
+            # 【關鍵修正】：只有當「這個 High」還沒被算過突破時，才執行計數
+            if last_swing_high != last_broken_high:
                 
-            # 產生多頭 OB
-            if last_pivot_low_candle is not None:
-                if not any(ob['idx'] == last_pivot_low_candle['idx'] for ob in obs):
-                    new_ob = last_pivot_low_candle.copy()
-                    new_ob['seq'] = trend_seq  # 寫入這是第幾個 OB
-                    obs.append(new_ob)
+                if current_trend != 1:
+                    # 趨勢反轉 (MSS) -> 重置為 1
+                    current_trend = 1
+                    trend_seq = 1  
+                else:
+                    # 趨勢延續 (BOS) -> 遞增
+                    trend_seq += 1 
+                
+                # 標記這個 High 已經處理過了，下一根 K 棒如果還在上面，不要再重複計算
+                last_broken_high = last_swing_high
+
+                # 產生多頭 OB
+                if last_pivot_low_candle is not None:
+                    if not any(ob['idx'] == last_pivot_low_candle['idx'] for ob in obs):
+                        new_ob = last_pivot_low_candle.copy()
+                        new_ob['seq'] = trend_seq  
+                        obs.append(new_ob)
             
-        # === 向下跌破 (潛在空頭) ===
+        # === 向下跌破 (Break Low) ===
         elif curr_close < last_swing_low:
-            # 判斷是 MSS 還是 BOS
-            if current_trend != -1:
-                # 趨勢從 多/無 -> 空 (MSS)
-                current_trend = -1
-                trend_seq = 1  # 重置計數為 1
-            else:
-                # 趨勢維持空頭 (BOS)
-                trend_seq += 1 # 計數遞增
+            # 【關鍵修正】：只有當「這個 Low」還沒被算過跌破時，才執行計數
+            if last_swing_low != last_broken_low:
                 
-            # 產生空頭 OB
-            if last_pivot_high_candle is not None:
-                if not any(ob['idx'] == last_pivot_high_candle['idx'] for ob in obs):
-                    new_ob = last_pivot_high_candle.copy()
-                    new_ob['seq'] = trend_seq  # 寫入這是第幾個 OB
-                    obs.append(new_ob)
+                if current_trend != -1:
+                    # 趨勢反轉 (MSS) -> 重置為 1
+                    current_trend = -1
+                    trend_seq = 1  
+                else:
+                    # 趨勢延續 (BOS) -> 遞增
+                    trend_seq += 1 
+                
+                # 標記這個 Low 已經處理過了
+                last_broken_low = last_swing_low
+                
+                # 產生空頭 OB
+                if last_pivot_high_candle is not None:
+                    if not any(ob['idx'] == last_pivot_high_candle['idx'] for ob in obs):
+                        new_ob = last_pivot_high_candle.copy()
+                        new_ob['seq'] = trend_seq 
+                        obs.append(new_ob)
             
         # --- C. 判斷進場 (回踩 OB) ---
         
         # [做多]
         if current_trend == 1: 
-            # 找未被測試過的 Bullish OB
             valid_obs = [ob for ob in obs if ob['type'] == 'bull' and not ob['mitigated'] and ob['top'] < curr_close]
             
             if valid_obs:
-                target_ob = valid_obs[-1] # 取最新的
+                target_ob = valid_obs[-1] 
                 
-                # 價格回踩 OB 上緣
                 if curr_low <= target_ob['top']:
-                    if i == len(df) - 1: # 必須是當前 K 棒發生的
+                    if i == len(df) - 1: 
                         final_side = "LONG"
                         final_entry = target_ob['top']
                         final_sl = target_ob['bottom']
                         final_tp1 = last_swing_high
                         risk = final_entry - final_sl
                         final_tp2 = final_entry + risk if risk > 0 else final_entry * 1.01
-                        final_ob_seq = target_ob['seq'] # 抓取這個 OB 的序號 (1, 2, 3...)
+                        final_ob_seq = target_ob['seq'] 
                         
                     target_ob['mitigated'] = True
         
         # [做空]
         elif current_trend == -1:
-            # 找未被測試過的 Bearish OB
             valid_obs = [ob for ob in obs if ob['type'] == 'bear' and not ob['mitigated'] and ob['bottom'] > curr_close]
             
             if valid_obs:
-                target_ob = valid_obs[-1] # 取最新的
+                target_ob = valid_obs[-1]
                 
-                # 價格回彈 OB 下緣
                 if curr_high >= target_ob['bottom']:
-                    if i == len(df) - 1: # 必須是當前 K 棒發生的
+                    if i == len(df) - 1:
                         final_side = "SHORT"
                         final_entry = target_ob['bottom']
                         final_sl = target_ob['top']
                         final_tp1 = last_swing_low
                         risk = final_sl - final_entry
                         final_tp2 = final_entry - risk if risk > 0 else final_entry * 0.99
-                        final_ob_seq = target_ob['seq'] # 抓取這個 OB 的序號 (1, 2, 3...)
+                        final_ob_seq = target_ob['seq'] 
                         
                     target_ob['mitigated'] = True
 
@@ -223,11 +231,9 @@ class TradingBot:
                     df = df.astype(float)
                     df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
                     
-                    # 接收 ob_seq
                     side, entry, sl, tp1, tp2, ob_seq, _ = process_smc_data(df)
                     
                     if side:
-                        # 將 ob_seq 寫入 key，避免同方向但不同 OB 的訊號被擋
                         signal_key = f"{symbol}_{tf}_{side}_{ob_seq}"
                         last_ts = self.last_signals.get(signal_key, 0)
                         current_ts = df['timestamp'].iloc[-1]
@@ -243,10 +249,7 @@ class TradingBot:
     def send_discord(self, symbol, side, interval, entry, sl, tp1, tp2, ob_seq):
         tw_time = (datetime.now(timezone.utc) + timedelta(hours=8)).strftime('%H:%M')
         
-        # 顯示處理：方向 做多(1)
         side_cn = "做多" if side == "LONG" else "做空"
-        
-        # 這裡就是你要的格式核心
         direction_str = f"{side_cn}({ob_seq})"
         
         exchange_name = "BYBIT"
@@ -265,7 +268,6 @@ class TradingBot:
 
         tp2_rr_str = "1:1"
 
-        # 輸出格式對齊
         msg = (
             f"{symbol} 訊號 {exchange_name}\n"
             f"方向 {direction_str}\n"
@@ -287,11 +289,10 @@ class TradingBot:
 
 if __name__ == "__main__":
     bot = TradingBot()
-    print("🚀 Zeabur SMC Bot (OB計數版) 已啟動...")
-    print(f"策略參數: PIVOT_LEN={PIVOT_LEN}")
+    print("🚀 Zeabur SMC Bot (計數修正版) 已啟動...")
     
-    # 測試顯示格式是否正確
-    bot.send_discord("BCH/USDT", "LONG", "30m", 627.3, 622.2, 653.3, 632.4, 1)
+    # 測試
+    bot.send_discord("FIX/USDT", "LONG", "30m", 100, 95, 110, 105, 1)
     
     while True:
         bot.run_analysis()
